@@ -35,7 +35,9 @@ import {
   submission_contributors,
   flags,
   users,
+  students,
 } from '../../db/schema.js';
+import { computeScore } from '../scoring/compute.js';
 import type { DrizzleDb } from '../../db/client.js';
 import { listCohortSubmissions, decodeCursor, type CohortCursor } from '../cohort/list.js';
 import { listStudents } from '../cohort/students.js';
@@ -661,6 +663,114 @@ describe('the already-scoped heuristics charge their acting contributor', () => 
           `charging it to the only contributor the bundle CAN name would move a finding ` +
           `onto the partner who did not do it — §6 Rule 2 exists to stop exactly that.`,
       ).toEqual([SCOPE_LEVEL, bobKey].sort());
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2a'. An unenrolled, UNNAMED partner and the sole-contributor rule
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe for `docs/group-attribution.md` §4 item 5.
+ *
+ * `scoreContributors` charges a SOLE contributor every flag, scope-level ones
+ * included, and "sole" is decided by counting `submission_contributors` rows.
+ * An unenrolled partner who is not a named submitter (the filename path names
+ * one `sid`) gets no row. So the enrolled submitter is the sole row and may be
+ * charged the partner's finding — which `attributeFlags` correctly left
+ * unnamed. This asserts the D14 property that a flag earned in one partner's
+ * session never scores against the other.
+ *
+ * KNOWN FAILURE, marked `it.fails` on purpose: today the enrolled partner is
+ * charged the finding. What a sole contributor SHOULD be charged when
+ * unattributed sessions exist is an open product decision. When the fix lands,
+ * flip this back to `it` — vitest will fail the run if it starts passing first.
+ */
+describe('an unenrolled partner who is not a named submitter', () => {
+  it.fails("does not charge the enrolled submitter for the partner's finding", async () => {
+    await withTestDb(async (db) => {
+      const { semester, job, assignment } = await seedWorld(db);
+      const work = 'def solve(values):\n    return sum(values)\n';
+
+      // Bob: enrolled, recorded, the one sid the filename named.
+      // Alice: recorded in the shared repo, never enrolled, pasted.
+      const bundle = (
+        await buildCollabScope([
+          { who: { studentRef: COLLAB_BOB }, events: collabPartnerSession(work) },
+          {
+            who: 'anonymous',
+            events: [collabDocOpen(work), bigPaste('hw1.py'), collabDocSave(work)],
+          },
+        ])
+      ).bundle;
+      const aliceSessionId = bundle.sessions[1]!.sessionId;
+
+      // Link Bob's verified institution ref to his roster row, as enrolment does.
+      await db.insert(students).values({
+        student_ref: COLLAB_BOB,
+        institution_id: 'test-institution',
+        sso_subject: `sub-bob-${crypto.randomUUID()}`,
+        sso_email: 'bob@berkeley.edu',
+      });
+      const [bobRoster] = await db
+        .insert(roster_entries)
+        .values({
+          semester_id: semester.id,
+          sid: '30000002',
+          display_name: 'Bob',
+          student_ref: COLLAB_BOB,
+        })
+        .returning();
+
+      const sub = await seedSubmission(db, {
+        semesterId: semester.id,
+        assignmentId: assignment.id,
+        ingestJobId: job.id,
+        studentId: bobRoster!.id,
+      });
+
+      const report = await runValidation(bundle);
+      await runAndStoreHeuristics(db, sub.id, semester.id, bundle, report);
+      await storeContributors(db, sub.id, semester.id, bundle, [bobRoster!.id]);
+      await attributeFlags(db, sub.id, bundle);
+      await applyContributorScores(db, sub.id);
+
+      const contributorRows = await db
+        .select()
+        .from(submission_contributors)
+        .where(eq(submission_contributors.submission_id, sub.id));
+      // Precondition: the shape under test really is ONE row.
+      expect(contributorRows).toHaveLength(1);
+      expect(contributorRows[0]!.roster_entry_id).toBe(bobRoster!.id);
+
+      const flagRows = await db
+        .select({
+          heuristic_id: flags.heuristic_id,
+          session_id: flags.session_id,
+          contributor_key: flags.contributor_key,
+          severity: flags.severity,
+          score_contribution: flags.score_contribution,
+        })
+        .from(flags)
+        .where(eq(flags.submission_id, sub.id));
+
+      const alicePaste = flagRows.filter(
+        (f) => f.heuristic_id === 'large_paste' && f.session_id === aliceSessionId,
+      );
+      // Preconditions: Alice's finding exists, is unnamed, and carries weight.
+      expect(alicePaste).toHaveLength(1);
+      expect(alicePaste[0]!.contributor_key).toBe(SCOPE_LEVEL);
+      expect(alicePaste[0]!.score_contribution).toBeGreaterThan(0);
+
+      const withoutAlice = computeScore(
+        flagRows.filter((f) => f.session_id !== aliceSessionId),
+      ).score_total;
+      expect(
+        contributorRows[0]!.score_total,
+        `Bob's per-contributor score must not include the finding from the ` +
+          `unenrolled partner's session`,
+      ).toBeCloseTo(withoutAlice);
     });
   });
 });
